@@ -52,6 +52,10 @@ type Config struct {
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 
+	// UsageAutoSaveInterval defines the interval (in minutes) for auto-saving usage statistics to disk.
+	// Default is 5 minutes. Set to 0 to disable auto-save (data will only be saved on shutdown).
+	UsageAutoSaveInterval int `yaml:"usage-auto-save-interval" json:"usage-auto-save-interval"`
+
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
@@ -114,7 +118,73 @@ type Config struct {
 	// from your current session. Default: false.
 	IncognitoBrowser bool `yaml:"incognito-browser" json:"incognito-browser"`
 
+	// License 定义 API Key 授权管理配置
+	License LicenseConfig `yaml:"license" json:"license"`
+
+	// InternalPort 内部端口配置（开发者/管理员直接调用，仅接受普通 api-keys）
+	InternalPort InternalPortConfig `yaml:"internal-port" json:"internal-port"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+// LicenseConfig 定义 API Key 授权管理配置
+type LicenseConfig struct {
+	// Enabled 启用 License 验证功能
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// StoragePath 激活码和 Key 数据的存储路径
+	StoragePath string `yaml:"storage-path" json:"storage-path"`
+
+	// ActivationCodeValidity 激活码的有效期（如 "7d"）
+	ActivationCodeValidity string `yaml:"activation-code-validity" json:"activation-code-validity"`
+
+	// DefaultKeyDuration 激活后 Key 的默认有效期（如 "30d"）
+	DefaultKeyDuration string `yaml:"default-key-duration" json:"default-key-duration"`
+
+	// RequireFingerprint 外部端口是否强制要求机器指纹验证（默认 true）
+	RequireFingerprint bool `yaml:"require-fingerprint" json:"require-fingerprint"`
+
+	// AllowMissingFingerprint 缺少指纹时是否允许请求（宽松模式，默认 false）
+	AllowMissingFingerprint bool `yaml:"allow-missing-fingerprint" json:"allow-missing-fingerprint"`
+
+	// EncryptStorage 是否加密存储 license_data.json（默认 false，明文存储）
+	EncryptStorage bool `yaml:"encrypt-storage" json:"encrypt-storage"`
+
+	// EncryptionKey 数据加密密钥（32字节 hex 编码，仅 encrypt-storage=true 时需要）
+	EncryptionKey string `yaml:"encryption-key" json:"encryption-key"`
+
+	// SigningKey 签名密钥（32字节 hex 编码，用于 License Key 生成）
+	SigningKey string `yaml:"signing-key" json:"signing-key"`
+
+	// ModelFilter 外部端口模型过滤配置
+	ModelFilter ModelFilterConfig `yaml:"model-filter" json:"model-filter"`
+}
+
+// ModelFilterConfig 模型过滤配置
+type ModelFilterConfig struct {
+	// Mode 过滤模式: "blacklist"（黑名单，默认）或 "whitelist"（白名单）
+	Mode string `yaml:"mode" json:"mode"`
+
+	// Models 模型列表（支持通配符，如 "gemini-*", "*-preview"）
+	Models []string `yaml:"models" json:"models"`
+}
+
+// InternalPortConfig 内部端口配置（开发者/管理员直接调用）
+type InternalPortConfig struct {
+	// Enabled 是否启用内部端口
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// Port 内部端口号（默认 8318）
+	Port int `yaml:"port" json:"port"`
+
+	// Host 内部端口绑定地址（默认与主端口相同）
+	Host string `yaml:"host" json:"host"`
+
+	// TLS 内部端口 TLS 配置
+	TLS TLSConfig `yaml:"tls" json:"tls"`
+
+	// APIKeys 内部端口专用 API Keys（如果为空则复用顶层 api-keys）
+	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 }
 
 // TLSConfig holds HTTPS server settings.
@@ -474,6 +544,12 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	cfg.IncognitoBrowser = false // Default to normal browser (AWS uses incognito by force)
+	// License 默认值
+	cfg.License.RequireFingerprint = true      // 默认强制指纹验证
+	cfg.License.AllowMissingFingerprint = false // 默认不允许缺少指纹
+	cfg.License.ModelFilter.Mode = "blacklist"  // 默认黑名单模式
+	// InternalPort 默认值
+	cfg.InternalPort.Port = 8318 // 默认内部端口
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {
 			// In cloud deploy mode, if YAML parsing fails, return empty config instead of error.

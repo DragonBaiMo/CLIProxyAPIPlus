@@ -7,6 +7,7 @@ package api
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -168,6 +169,20 @@ type Server struct {
 	keepAliveOnTimeout func()
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
+
+	// licenseMiddleware 处理 License Key 验证
+	licenseMiddleware *middleware.LicenseMiddleware
+	// licenseHandler 处理 License 管理 API
+	licenseHandler *managementHandlers.LicenseHandler
+
+	// modelFilter 处理外部端口模型过滤
+	modelFilter *middleware.ModelFilter
+
+	// 内部端口相关字段
+	internalEngine        *gin.Engine
+	internalServer        *http.Server
+	internalAccessManager *sdkaccess.Manager
+	internalPortEnabled   bool
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -265,6 +280,79 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.mgmt.SetLogDirectory(logDir)
 	s.localPassword = optionState.localPassword
 
+	// 初始化面板状态存储（启动时自动加载，每5分钟自动保存）
+	// 即使 configFilePath 为空，也会使用 WRITABLE_PATH 或当前工作目录
+	managementHandlers.InitPanelStateStore(configFilePath, 5*time.Minute)
+
+	// 初始化使用统计持久化（启动时自动加载，根据配置自动保存）
+	usageAutoSaveInterval := 5 * time.Minute // 默认 5 分钟
+	if cfg.UsageAutoSaveInterval > 0 {
+		usageAutoSaveInterval = time.Duration(cfg.UsageAutoSaveInterval) * time.Minute
+	} else if cfg.UsageAutoSaveInterval < 0 {
+		usageAutoSaveInterval = 0 // 禁用自动保存
+	}
+	usage.InitUsagePersistence(configFilePath, usageAutoSaveInterval)
+
+	// Initialize license middleware and handler if enabled
+	if cfg.License.Enabled {
+		storagePath := cfg.License.StoragePath
+		if storagePath == "" {
+			storagePath = "license_data.json"
+		}
+		// 如果是相对路径，则相对于配置文件目录
+		if !filepath.IsAbs(storagePath) && configFilePath != "" {
+			storagePath = filepath.Join(filepath.Dir(configFilePath), storagePath)
+		}
+
+		// 解析加密密钥（从配置文件读取）
+		var encKey, signKey []byte
+		if cfg.License.EncryptionKey != "" {
+			if decoded, err := hex.DecodeString(cfg.License.EncryptionKey); err == nil && len(decoded) == 32 {
+				encKey = decoded
+			} else {
+				log.Warn("License encryption-key 无效（需要 64 位 hex 编码的 32 字节密钥），将使用默认密钥")
+			}
+		}
+		if cfg.License.SigningKey != "" {
+			if decoded, err := hex.DecodeString(cfg.License.SigningKey); err == nil && len(decoded) == 32 {
+				signKey = decoded
+			} else {
+				log.Warn("License signing-key 无效（需要 64 位 hex 编码的 32 字节密钥），将使用默认密钥")
+			}
+		}
+
+		licenseStore, err := middleware.NewLicenseStoreWithCrypto(storagePath, encKey, signKey, cfg.License.EncryptStorage)
+		if err != nil {
+			log.Errorf("初始化 License 存储失败: %v", err)
+		} else {
+			s.licenseMiddleware = middleware.NewLicenseMiddleware(licenseStore, true)
+
+			// 解析激活码有效期
+			codeValidity := 7 * 24 * time.Hour // 默认 7 天
+			if cfg.License.ActivationCodeValidity != "" {
+				if parsed, err := parseLicenseDuration(cfg.License.ActivationCodeValidity); err == nil {
+					codeValidity = parsed
+				}
+			}
+
+			defaultDuration := cfg.License.DefaultKeyDuration
+			if defaultDuration == "" {
+				defaultDuration = "30d"
+			}
+
+			s.licenseHandler = managementHandlers.NewLicenseHandler(licenseStore, defaultDuration, codeValidity)
+			log.Info("License 授权管理已启用")
+
+			// 设置 License 中间件的指纹验证配置
+			s.licenseMiddleware.SetRequireFingerprint(cfg.License.RequireFingerprint)
+		}
+	}
+
+	// 初始化内部端口服务器（如果启用）
+	if cfg.InternalPort.Enabled {
+		s.initInternalServer(cfg, authManager, optionState)
+	}
+
 	// Setup routes
 	s.setupRoutes()
 
@@ -317,7 +405,10 @@ func (s *Server) setupRoutes() {
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
-	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(middleware.ExternalAuthMiddleware(s.accessManager, s.cfg.License.Enabled))
+	v1.Use(s.licenseMiddlewareHandler())
+	v1.Use(middleware.LicenseModelFilterMiddleware()) // 模型权限过滤
+	v1.Use(middleware.AccessAuditMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -329,7 +420,10 @@ func (s *Server) setupRoutes() {
 
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
-	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(middleware.ExternalAuthMiddleware(s.accessManager, s.cfg.License.Enabled))
+	v1beta.Use(s.licenseMiddlewareHandler())
+	v1beta.Use(middleware.LicenseModelFilterMiddleware()) // 模型权限过滤
+	v1beta.Use(middleware.AccessAuditMiddleware())
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -498,6 +592,11 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/usage", s.mgmt.GetUsageStatistics)
 		mgmt.GET("/usage/export", s.mgmt.ExportUsageStatistics)
 		mgmt.POST("/usage/import", s.mgmt.ImportUsageStatistics)
+
+		// 面板状态持久化（模型价格等前端配置）
+		mgmt.GET("/panel-state", s.mgmt.GetPanelState)
+		mgmt.POST("/panel-state", s.mgmt.UpdatePanelState)
+		mgmt.PUT("/panel-state", s.mgmt.UpdatePanelState)
 		mgmt.GET("/config", s.mgmt.GetConfig)
 		mgmt.GET("/config.yaml", s.mgmt.GetConfigYAML)
 		mgmt.PUT("/config.yaml", s.mgmt.PutConfigYAML)
@@ -620,7 +719,41 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/kiro-auth-url", s.mgmt.RequestKiroToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
-	}
+
+		// License 管理路由
+		if s.licenseHandler != nil {
+			// 激活码管理
+			mgmt.POST("/license/codes", s.licenseHandler.CreateActivationCode)
+			mgmt.POST("/license/codes/batch", s.licenseHandler.BatchCreateActivationCodes)
+			mgmt.GET("/license/codes", s.licenseHandler.ListActivationCodes)
+			mgmt.GET("/license/codes/:code", s.licenseHandler.GetActivationCode)
+			mgmt.PATCH("/license/codes/:code", s.licenseHandler.UpdateActivationCodeMemo)
+			mgmt.PATCH("/license/codes/:code/disable", s.licenseHandler.DisableActivationCode)
+			mgmt.PATCH("/license/codes/:code/enable", s.licenseHandler.EnableActivationCode)
+			mgmt.DELETE("/license/codes/:code", s.licenseHandler.DeleteActivationCode)
+
+			// 激活接口（供激活程序调用）
+			mgmt.POST("/license/activate", s.licenseHandler.Activate)
+
+			// License Key 管理
+			mgmt.GET("/license/keys", s.licenseHandler.ListLicensedKeys)
+			mgmt.GET("/license/keys/:key", s.licenseHandler.GetLicensedKey)
+			mgmt.PATCH("/license/keys/:key", s.licenseHandler.UpdateKeyMemo)
+			mgmt.PATCH("/license/keys/:key/restore", s.licenseHandler.RestoreKey)
+			mgmt.PATCH("/license/keys/:key/extend", s.licenseHandler.ExtendKey)
+			mgmt.DELETE("/license/keys/:key", s.licenseHandler.RevokeKey)
+			mgmt.DELETE("/license/keys/:key/ban", s.licenseHandler.BanKey)
+			mgmt.DELETE("/license/keys/:key/unbind", s.licenseHandler.UnbindKey)
+		}
+        }
+
+        // License 公开路由（无需管理密钥）
+        if s.licenseHandler != nil {
+                // 激活接口（供用户客户端调用）
+                s.engine.POST("/v0/license/activate", s.licenseHandler.Activate)
+                // 心跳验证接口
+                s.engine.POST("/v0/license/heartbeat", s.licenseHandler.Heartbeat)
+        }
 }
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
@@ -767,6 +900,11 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to start HTTP server: server not initialized")
 	}
 
+	// 启动内部端口服务器（如果启用）
+	if s.internalPortEnabled && s.internalServer != nil {
+		go s.startInternalServer()
+	}
+
 	useTLS := s.cfg != nil && s.cfg.TLS.Enable
 	if useTLS {
 		cert := strings.TrimSpace(s.cfg.TLS.Cert)
@@ -789,6 +927,33 @@ func (s *Server) Start() error {
 	return nil
 }
 
+// startInternalServer 启动内部端口服务器
+func (s *Server) startInternalServer() {
+	if s.internalServer == nil {
+		return
+	}
+
+	useTLS := s.cfg != nil && s.cfg.InternalPort.TLS.Enable
+	if useTLS {
+		cert := strings.TrimSpace(s.cfg.InternalPort.TLS.Cert)
+		key := strings.TrimSpace(s.cfg.InternalPort.TLS.Key)
+		if cert == "" || key == "" {
+			log.Errorf("内部端口 HTTPS 启动失败: tls.cert 或 tls.key 为空")
+			return
+		}
+		log.Infof("内部端口服务器启动: %s (HTTPS)", s.internalServer.Addr)
+		if err := s.internalServer.ListenAndServeTLS(cert, key); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Errorf("内部端口 HTTPS 服务器错误: %v", err)
+		}
+		return
+	}
+
+	log.Infof("内部端口服务器启动: %s (HTTP)", s.internalServer.Addr)
+	if err := s.internalServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Errorf("内部端口 HTTP 服务器错误: %v", err)
+	}
+}
+
 // Stop gracefully shuts down the API server without interrupting any
 // active connections.
 //
@@ -804,6 +969,22 @@ func (s *Server) Stop(ctx context.Context) error {
 		select {
 		case s.keepAliveStop <- struct{}{}:
 		default:
+		}
+	}
+
+	// 保存面板状态
+	managementHandlers.SavePanelStateOnShutdown()
+
+	// 保存使用统计
+	usage.SaveUsageOnShutdown()
+
+	// 关闭内部端口服务器（如果启用）
+	if s.internalPortEnabled && s.internalServer != nil {
+		log.Debug("Stopping internal port server...")
+		if err := s.internalServer.Shutdown(ctx); err != nil {
+			log.Warnf("关闭内部端口服务器失败: %v", err)
+		} else {
+			log.Debug("Internal port server stopped")
 		}
 	}
 
@@ -834,6 +1015,25 @@ func corsMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// parseLicenseDuration 解析持续时间字符串（支持 "30d", "7d", "1h" 等格式）
+func parseLicenseDuration(s string) (time.Duration, error) {
+	if len(s) == 0 {
+		return 0, fmt.Errorf("空的持续时间字符串")
+	}
+
+	// 处理天数格式
+	if s[len(s)-1] == 'd' {
+		var days int
+		if _, err := fmt.Sscanf(s, "%dd", &days); err != nil {
+			return 0, err
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+
+	// 使用标准库解析
+	return time.ParseDuration(s)
 }
 
 func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) {
@@ -1011,6 +1211,113 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	)
 }
 
+// initInternalServer 初始化内部端口服务器
+func (s *Server) initInternalServer(cfg *config.Config, authManager *auth.Manager, optionState *serverOptionConfig) {
+	if !cfg.InternalPort.Enabled {
+		return
+	}
+
+	s.internalPortEnabled = true
+
+	// 创建内部端口 Gin 引擎
+	internalEngine := gin.New()
+	if optionState.engineConfigurator != nil {
+		optionState.engineConfigurator(internalEngine)
+	}
+
+	// 添加基础中间件
+	internalEngine.Use(logging.GinLogrusLogger())
+	internalEngine.Use(logging.GinLogrusRecovery())
+	for _, mw := range optionState.extraMiddleware {
+		internalEngine.Use(mw)
+	}
+	internalEngine.Use(corsMiddleware())
+
+	// 创建内部端口的 AccessManager
+	internalAPIKeys := cfg.InternalPort.APIKeys
+	if len(internalAPIKeys) == 0 {
+		// 如果没有配置内部端口专用 Key，则复用顶层 api-keys
+		internalAPIKeys = cfg.SDKConfig.APIKeys
+	}
+
+	// 创建内部端口专用的 AccessManager
+	internalAccessManager := sdkaccess.NewManager()
+	if len(internalAPIKeys) > 0 {
+		internalProviderCfg := config.MakeInlineAPIKeyProvider(internalAPIKeys)
+		if internalProviderCfg != nil {
+			internalProvider, err := sdkaccess.BuildProvider(internalProviderCfg, &cfg.SDKConfig)
+			if err != nil {
+				log.Warnf("创建内部端口 Provider 失败: %v", err)
+			} else {
+				internalAccessManager.SetProviders([]sdkaccess.Provider{internalProvider})
+			}
+		}
+	}
+	s.internalAccessManager = internalAccessManager
+
+	// 设置内部端口路由
+	s.setupInternalRoutes(internalEngine)
+
+	s.internalEngine = internalEngine
+
+	// 确定内部端口绑定地址
+	internalHost := cfg.InternalPort.Host
+	if internalHost == "" {
+		internalHost = cfg.Host
+	}
+
+	// 创建内部端口 HTTP 服务器
+	s.internalServer = &http.Server{
+		Addr:    fmt.Sprintf("%s:%d", internalHost, cfg.InternalPort.Port),
+		Handler: internalEngine,
+	}
+
+	log.Infof("内部端口服务器已初始化: %s:%d", internalHost, cfg.InternalPort.Port)
+}
+
+// setupInternalRoutes 设置内部端口路由
+func (s *Server) setupInternalRoutes(engine *gin.Engine) {
+	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
+	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
+	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
+	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
+
+	// OpenAI compatible API routes（内部端口）
+	v1 := engine.Group("/v1")
+	v1.Use(middleware.InternalAuthMiddleware(s.internalAccessManager))
+	v1.Use(middleware.AccessAuditMiddleware())
+	{
+		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
+		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
+		v1.POST("/completions", openaiHandlers.Completions)
+		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
+		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
+		v1.POST("/responses", openaiResponsesHandlers.Responses)
+	}
+
+	// Gemini compatible API routes（内部端口）
+	v1beta := engine.Group("/v1beta")
+	v1beta.Use(middleware.InternalAuthMiddleware(s.internalAccessManager))
+	v1beta.Use(middleware.AccessAuditMiddleware())
+	{
+		v1beta.GET("/models", geminiHandlers.GeminiModels)
+		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
+		v1beta.GET("/models/*action", geminiHandlers.GeminiGetHandler)
+	}
+
+	// Root endpoint
+	engine.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "CLI Proxy API Server (Internal Port)",
+			"endpoints": []string{
+				"POST /v1/chat/completions",
+				"POST /v1/completions",
+				"GET /v1/models",
+			},
+		})
+	})
+}
+
 func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 	if s == nil {
 		return
@@ -1019,6 +1326,17 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 }
 
 // (management handlers moved to internal/api/handlers/management)
+
+// licenseMiddlewareHandler 返回 License 验证中间件
+// 如果 License 系统未启用，返回一个直接放行的中间件
+func (s *Server) licenseMiddlewareHandler() gin.HandlerFunc {
+	if s.licenseMiddleware == nil {
+		return func(c *gin.Context) {
+			c.Next()
+		}
+	}
+	return s.licenseMiddleware.Handler()
+}
 
 // AuthMiddleware returns a Gin middleware handler that authenticates requests
 // using the configured authentication providers. When no providers are available,

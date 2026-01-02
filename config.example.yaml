@@ -40,6 +40,52 @@ api-keys:
 # Enable debug logging
 debug: false
 
+# License 授权管理配置
+# 用于生成时效性 API Key，绑定机器指纹，防止 Key 被转让/共享
+license:
+  # 是否启用 License 授权系统
+  enabled: false
+  # License 数据存储路径（相对于配置文件目录，或绝对路径）
+  storage-path: "license_data.json"
+  # 激活码有效期（支持 7d, 30d, 1h 等格式）
+  activation-code-validity: "7d"
+  # 默认 License Key 有效期
+  default-key-duration: "30d"
+  # 外部端口是否强制要求机器指纹验证（默认 true，防止 Key 分享）
+  require-fingerprint: true
+  # 宽松模式：缺少指纹时仅记录警告而不拒绝请求（默认 false）
+  allow-missing-fingerprint: false
+  # 是否加密存储 license_data.json（默认 false，明文 JSON 存储）
+  encrypt-storage: false
+  # 数据加密密钥（32字节，64位 hex 编码，仅 encrypt-storage=true 时需要）
+  # 生成方式: openssl rand -hex 32
+  encryption-key: ""
+  # 签名密钥（32字节，64位 hex 编码，用于 License Key 生成和验证）
+  # 生成方式: openssl rand -hex 32
+  # 重要：更换此密钥会导致所有已生成的 License Key 失效！
+  signing-key: ""
+
+# 内部端口配置（开发者/管理员直接调用，仅接受普通 api-keys）
+# 内部端口不进行 License 验证，不要求机器指纹，适合开发调试
+internal-port:
+  # 是否启用内部端口
+  enabled: false
+  # 内部端口号（默认 8318）
+  port: 8318
+  # 内部端口绑定地址（默认与主端口相同，建议设为 127.0.0.1 限制本地访问）
+  host: "127.0.0.1"
+  # 内部端口 TLS 配置（可独立于主端口配置）
+  tls:
+    enable: false
+    cert: ""
+    key: ""
+  # 内部端口专用 API Keys（如果为空则复用顶层 api-keys）
+  # 注意：内部端口不接受 sk-lic-* 前缀的 License Key
+  api-keys: []
+  # api-keys:
+  #   - "internal-dev-key-1"
+  #   - "internal-admin-key-2"
+
 # When true, disable high-overhead HTTP middleware features to reduce per-request memory usage under high concurrency.
 commercial-mode: false
 
@@ -57,6 +103,11 @@ logs-max-total-size-mb: 0
 
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
+
+# Auto-save interval (in minutes) for usage statistics persistence.
+# Default is 5 minutes. Set to 0 to only save on shutdown.
+# Usage data is automatically saved to usage-stats.json in the config directory.
+usage-auto-save-interval: 5
 
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 proxy-url: ""

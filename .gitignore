@@ -7,6 +7,12 @@ cliproxy
 config.yaml
 .env
 
+# License/Key Project (独立子项目)
+ProxyKeyProject/
+
+# Windows special files
+nul
+
 # Generated content
 bin/*
 logs/*
